@@ -57,7 +57,7 @@ model = dict(
         nms=dict(type='nms', iou_threshold=0.5),
         max_per_img=100))
 dataset_type = 'CocoDataset'
-data_root = '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/'
+data_root = '/gdata1/zhuqi/DarkFace_coco_0.666/'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 train_pipeline = [
@@ -94,14 +94,14 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=1,
     workers_per_gpu=2,
     train=dict(
         type='CocoDataset',
         ann_file=
-        '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/annotations/train_annotations.json',
+        '/gdata1/zhuqi/DarkFace_coco_0.666/annotations/train_annotations.json',
         img_prefix=
-        '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/train/',
+        '/gdata1/zhuqi/DarkFace_coco_0.666/train/',
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(type='LoadAnnotations', with_bbox=True),
@@ -119,9 +119,9 @@ data = dict(
     val=dict(
         type='CocoDataset',
         ann_file=
-        '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/annotations/val_annotations.json',
+        '/gdata1/zhuqi/DarkFace_coco_0.666/annotations/val_annotations.json',
         img_prefix=
-        '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/val/',
+        '/gdata1/zhuqi/DarkFace_coco_0.666/val/',
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(
@@ -144,9 +144,9 @@ data = dict(
     test=dict(
         type='CocoDataset',
         ann_file=
-        '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/annotations/val_annotations.json',
+        '/gdata1/zhuqi/DarkFace_coco_0.666/annotations/val_annotations.json',
         img_prefix=
-        '/ghome/zhuqi/mmlab/mmdetection/data/DarkFace_coco_0.666/val/',
+        '/gdata1/zhuqi/DarkFace_coco_0.666/val/',
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(
@@ -167,7 +167,7 @@ data = dict(
                 ])
         ]))
 evaluation = dict(interval=1, metric='bbox')
-optimizer = dict(type='SGD', lr=0.01, momentum=0.9, weight_decay=0.0001)
+optimizer = dict(type='SGD', lr=0.00125, momentum=0.9, weight_decay=0.0001)
 optimizer_config = dict(grad_clip=None)
 lr_config = dict(
     policy='step',
@@ -184,5 +184,5 @@ log_level = 'INFO'
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
-work_dir = '/ghome/zhuqi/mmlab/mmdetection/work_dirs/darkface_coco_0.66'
+work_dir = '/gdata2/zhuqi/work_dirs/batch1_gpu1_lr0.00125'
 gpu_ids = range(0, 1)

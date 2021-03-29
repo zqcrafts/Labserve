@@ -5,8 +5,10 @@ import numpy as np
 from numpy import random
 
 from mmdet.core import PolygonMasks
-from mmdet.core.evaluation.bbox_overlaps import bbox_overlaps
+# from mmdet.core.evaluation.bbox_overlaps import bbox_overlaps
+from mmdet.core.bbox import bbox_overlaps
 from ..builder import PIPELINES
+import cv2
 
 try:
     from imagecorruptions import corrupt
@@ -309,7 +311,7 @@ class Resize(object):
         repr_str += f'(img_scale={self.img_scale}, '
         repr_str += f'multiscale_mode={self.multiscale_mode}, '
         repr_str += f'ratio_range={self.ratio_range}, '
-        repr_str += f'keep_ratio={self.keep_ratio}, '
+        repr_str += f'keep_ratio={self.keep_ratio})'
         repr_str += f'bbox_clip_border={self.bbox_clip_border})'
         return repr_str
 
@@ -470,6 +472,30 @@ class RandomFlip(object):
     def __repr__(self):
         return self.__class__.__name__ + f'(flip_ratio={self.flip_ratio})'
 
+# @PIPELINES.register_module()
+# class Shift(object):
+#     def __init__(self):
+#         pass
+
+#     def _shift_img(self, results):
+#         """Pad images according to ``self.size``."""
+#         shift_offset = results.get('shift_offset', None)
+#         for key in results.get('img_fields', ['img']):
+#             if shift_offset is not None:
+#                 padded_img = mmcv.impad(
+#                     results[key], padding=(shift_offset[0], shift_offset[1], 0, 0), pad_val=0)
+#             results[key] = padded_img
+#         results['img_shape'] = padded_img.shape
+#         # in case there is no padding
+#         results['pad_shape'] = padded_img.shape
+
+#     def __call__(self, results):
+#         self._shift_img(results)
+#         return results
+
+#     def __repr__(self):
+#         repr_str = self.__class__.__name__
+#         return repr_str
 
 @PIPELINES.register_module()
 class Pad(object):
@@ -582,6 +608,306 @@ class Normalize(object):
         repr_str += f'(mean={self.mean}, std={self.std}, to_rgb={self.to_rgb})'
         return repr_str
 
+def matrix_iof(a, b):
+    """
+    return iof of a and b, numpy version for data augenmentation
+    """
+    lt = np.maximum(a[:, np.newaxis, :2], b[:, :2])
+    rb = np.minimum(a[:, np.newaxis, 2:], b[:, 2:])
+
+    area_i = np.prod(rb - lt, axis=2) * (lt < rb).all(axis=2)
+    area_a = np.prod(a[:, 2:] - a[:, :2], axis=1)
+    return area_i / np.maximum(area_a[:, np.newaxis], 1)
+
+@PIPELINES.register_module()
+class AdvancedAug(object):
+    def __init__(self, img_scale=640, min_ratio=0.3, max_ratio=1.0):
+        self.img_scale = img_scale
+        self.min_ratio = min_ratio
+        self.max_ratio = max_ratio
+
+        self.bbox2label = {
+            'gt_bboxes': 'gt_labels',
+            'gt_bboxes_ignore': 'gt_labels_ignore'
+        }
+        self.bbox2mask = {
+            'gt_bboxes': 'gt_masks',
+            'gt_bboxes_ignore': 'gt_masks_ignore'
+        }
+
+    # def _generate_anchor_size_list(self):
+    #     anchor_size_list = []; base_scale = 2 ** (4 / 3)
+    #     for stride in [4, 8, 16, 32, 64, 128]:
+    #         for aspect_ratio in [0, 1, 2]:
+    #             anchor_size = stride * base_scale * 2 ** (aspect_ratio / 3)
+    #             anchor_size_list.append(anchor_size)
+    #     return anchor_size_list
+
+    def _generate_anchor_size(self, min_anchor_size, max_anchor_size):
+        min_size = np.log2(min_anchor_size)
+        max_size = np.log2(max_anchor_size)
+
+        interval_list = [[2, 4.5], [4.5, 5.5], [5.5, 6.5], [6.5, 7.5], \
+                          [7.5, 8.5], [8.5, 9.5]]
+        weight_list = [1/4, 1/8, 1/16, 1/32, 1/64, 1/128]
+        valid_list = []; valid_weight_list = []
+        for interval, weight in zip(interval_list, weight_list):
+            if min_size <= interval[0]:
+                if max_size > interval[1]:
+                    valid_list.append(interval); valid_weight_list.append(weight)
+                elif max_size < interval[0]:
+                    break
+                else:
+                    valid_list.append([interval[0], max_size]); valid_weight_list.append(weight)
+                    break
+            else:
+                if min_size > interval[1]:
+                    continue
+                else:
+                    if max_size > interval[1]:
+                        valid_list.append([min_size, interval[1]]); valid_weight_list.append(weight)
+                    else:
+                        valid_list.append([min_size, max_size]); valid_weight_list.append(weight)
+                        break
+        if len(valid_list) == 0:
+            return -1
+        select_idx = np.random.choice(len(valid_list), 1, p=np.array(valid_weight_list)/np.sum(valid_weight_list))[0]
+        select_interval = valid_list[select_idx]
+        select_size = np.random.uniform(*select_interval)
+        return 2 ** select_size
+
+    def _generate_crop_size(self, bbox_size, img_min_size):
+        min_crop_size = int(img_min_size * self.min_ratio)
+        max_crop_size = int(img_min_size * self.max_ratio)
+
+        min_anchor_size = bbox_size * self.img_scale / max_crop_size
+        max_anchor_size = bbox_size * self.img_scale / min_crop_size
+
+        select_anchor_size = self._generate_anchor_size(min_anchor_size, max_anchor_size) 
+        if select_anchor_size == -1:
+            print(bbox_size, img_min_size)
+            return max_crop_size  
+        select_crop_size = int(bbox_size * self.img_scale / select_anchor_size)
+        select_crop_size = min(select_crop_size, max_crop_size)         # avoid special case
+        return select_crop_size
+
+    def __call__(self, results):
+        if 'img_fields' in results:
+            assert results['img_fields'] == ['img'], \
+                'Only single img_fields is allowed'
+        img = results['img']
+        # boxes = [results[key] for key in results['bbox_fields']]
+        # boxes = np.concatenate(boxes, 0)
+        boxes = results['gt_bboxes']
+        img_h, img_w = img.shape[:2]
+        img_min_size = min(img_h, img_w)
+
+        # compute the maximum of resize ratio range
+        valid_idx = np.arange(boxes.shape[0])
+        rand_idx = np.random.choice(valid_idx, 1)[0]
+        select_box = boxes[rand_idx]
+        box_w = select_box[2] - select_box[0] + 1
+        box_h = select_box[3] - select_box[1] + 1
+        select_box_max_hw = max(box_w, box_h)
+
+        crop_size = self._generate_crop_size(select_box_max_hw, img_min_size)
+
+        x1, y1, x2, y2 = select_box
+        x_start = max(x2 - crop_size, 0); x_end = min(x1, img_w - crop_size)
+        y_start = max(y2 - crop_size, 0); y_end = min(y1, img_h - crop_size)
+
+        step_size = 10; iou_thres = 0.75; same_variance_ratio = 0.3
+        select_box_area = (y2 - y1) * (x2 - x1)
+        areas = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+        valid_idx = np.where((areas >= (1 - same_variance_ratio) * select_box_area) \
+                        & (areas <= (1 + same_variance_ratio) * select_box_area))[0]
+        select_boxes = boxes[valid_idx]
+
+        x1_grids = np.linspace(x_start, x_end, step_size)
+        y1_grids = np.linspace(y_start, y_end, step_size)
+        rois_list = []; cnt_list = []
+
+        for x1_grid in x1_grids:
+            for y1_grid in y1_grids:
+                crop_roi = np.array([x1_grid, y1_grid, x1_grid + crop_size, y1_grid + crop_size]).astype(np.int)
+                values = matrix_iof(select_boxes, crop_roi[np.newaxis])
+                cnt = np.sum(values > iou_thres)
+                cnt_list.append(cnt); rois_list.append(crop_roi)
+
+        cnts = np.array(cnt_list); rois = np.array(rois_list)
+        max_cover_cnt = np.max(cnts)
+        select_idx = np.random.choice(np.where(cnts == max_cover_cnt)[0], 1)[0]
+        patch = rois[select_idx].reshape(-1,)
+
+        def is_center_of_bboxes_in_patch(boxes, patch):
+            # TODO >=
+            center = (boxes[:, :2] + boxes[:, 2:]) / 2
+            mask = ((center[:, 0] > patch[0]) *
+                    (center[:, 1] > patch[1]) *
+                    (center[:, 0] < patch[2]) *
+                    (center[:, 1] < patch[3]))
+            return mask
+
+        mask = is_center_of_bboxes_in_patch(boxes, patch)
+        for key in results.get('bbox_fields', []):
+            boxes = results[key].copy()
+            mask = is_center_of_bboxes_in_patch(boxes, patch)
+            boxes = boxes[mask]
+            boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
+            boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
+            boxes -= np.tile(patch[:2], 2)
+
+            results[key] = boxes
+            # labels
+            label_key = self.bbox2label.get(key)
+            if label_key in results:
+                results[label_key] = results[label_key][mask]
+
+            # mask fields
+            mask_key = self.bbox2mask.get(key)
+            if mask_key in results:
+                results[mask_key] = results[mask_key][mask.nonzero()
+                                                        [0]].crop(patch)
+
+        # adjust the img no matter whether the gt is empty before crop
+        img = img[patch[1]:patch[3], patch[0]:patch[2]]
+        results['img'] = img
+        results['img_shape'] = img.shape
+
+        # seg fields
+        for key in results.get('seg_fields', []):
+            results[key] = results[key][patch[1]:patch[3],
+                                        patch[0]:patch[2]]
+        return results
+
+@PIPELINES.register_module()
+class RandomSquareCrop(object):
+    """Random crop the image & bboxes, the cropped patches have minimum IoU
+    requirement with original image & bboxes, the IoU threshold is randomly
+    selected from min_ious.
+    Args:
+        min_ious (tuple): minimum IoU threshold for all intersections with
+        bounding boxes
+        min_crop_size (float): minimum crop's size (i.e. h,w := a*h, a*w,
+        where a >= min_crop_size).
+    Note:
+        The keys for bboxes, labels and masks should be paired. That is, \
+        `gt_bboxes` corresponds to `gt_labels` and `gt_masks`, and \
+        `gt_bboxes_ignore` to `gt_labels_ignore` and `gt_masks_ignore`.
+    """
+
+    def __init__(self, crop_ratio_range=None, crop_choice=None, p=1.0):
+
+        self.crop_ratio_range = crop_ratio_range
+        self.crop_choice = crop_choice
+
+        assert (self.crop_ratio_range is None) ^ (self.crop_choice is None)
+        if self.crop_ratio_range is not None:
+            self.crop_ratio_min, self.crop_ratio_max = self.crop_ratio_range
+
+        self.bbox2label = {
+            'gt_bboxes': 'gt_labels',
+            'gt_bboxes_ignore': 'gt_labels_ignore'
+        }
+        self.bbox2mask = {
+            'gt_bboxes': 'gt_masks',
+            'gt_bboxes_ignore': 'gt_masks_ignore'
+        }
+        self.p = p
+
+    def __call__(self, results):
+        """Call function to crop images and bounding boxes with minimum IoU
+        constraint.
+        Args:
+            results (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Result dict with images and bounding boxes cropped, \
+                'img_shape' key is updated.
+        """
+
+        if random.uniform(0, 1) >= self.p:
+            return results
+
+        if 'img_fields' in results:
+            assert results['img_fields'] == ['img'], \
+                'Only single img_fields is allowed'
+        img = results['img']
+        assert 'bbox_fields' in results
+        boxes = [results[key] for key in results['bbox_fields']]
+        boxes = np.concatenate(boxes, 0)
+
+        h, w, c = img.shape
+
+        while True:
+            if self.crop_ratio_range is not None:
+                scale = np.random.uniform(self.crop_ratio_min,
+                                          self.crop_ratio_max)
+            elif self.crop_choice is not None:
+                scale = np.random.choice(self.crop_choice)
+
+            for i in range(250):
+                short_side = min(w, h)
+                cw = int(scale * short_side)
+                ch = cw
+
+                # TODO +1
+                left = random.uniform(w - cw)
+                top = random.uniform(h - ch)
+
+                patch = np.array(
+                    (int(left), int(top), int(left + cw), int(top + ch)))
+
+                # center of boxes should inside the crop img
+                # only adjust boxes and instance masks when the gt is not empty
+                # adjust boxes
+                def is_center_of_bboxes_in_patch(boxes, patch):
+                    # TODO >=
+                    center = (boxes[:, :2] + boxes[:, 2:]) / 2
+                    mask = ((center[:, 0] > patch[0]) *
+                            (center[:, 1] > patch[1]) *
+                            (center[:, 0] < patch[2]) *
+                            (center[:, 1] < patch[3]))
+                    return mask
+
+                mask = is_center_of_bboxes_in_patch(boxes, patch)
+                if not mask.any():
+                    continue
+                for key in results.get('bbox_fields', []):
+                    boxes = results[key].copy()
+                    mask = is_center_of_bboxes_in_patch(boxes, patch)
+                    boxes = boxes[mask]
+                    boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
+                    boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
+                    boxes -= np.tile(patch[:2], 2)
+
+                    results[key] = boxes
+                    # labels
+                    label_key = self.bbox2label.get(key)
+                    if label_key in results:
+                        results[label_key] = results[label_key][mask]
+
+                    # mask fields
+                    mask_key = self.bbox2mask.get(key)
+                    if mask_key in results:
+                        results[mask_key] = results[mask_key][mask.nonzero()
+                                                              [0]].crop(patch)
+
+                # adjust the img no matter whether the gt is empty before crop
+                img = img[patch[1]:patch[3], patch[0]:patch[2]]
+                results['img'] = img
+                results['img_shape'] = img.shape
+
+                # seg fields
+                for key in results.get('seg_fields', []):
+                    results[key] = results[key][patch[1]:patch[3],
+                                                patch[0]:patch[2]]
+                return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(min_ious={self.min_iou}, '
+        repr_str += f'crop_size={self.crop_size})'
+        return repr_str
 
 @PIPELINES.register_module()
 class RandomCrop(object):
@@ -831,12 +1157,14 @@ class PhotoMetricDistortion(object):
                  brightness_delta=32,
                  contrast_range=(0.5, 1.5),
                  saturation_range=(0.5, 1.5),
-                 hue_delta=18):
+                 hue_delta=18,
+                 p=0.5):
         self.brightness_delta = brightness_delta
         self.contrast_lower, self.contrast_upper = contrast_range
         self.saturation_lower, self.saturation_upper = saturation_range
         self.hue_delta = hue_delta
-
+        self.p = p
+        
     def __call__(self, results):
         """Call function to perform photometric distortion on images.
 
@@ -854,50 +1182,61 @@ class PhotoMetricDistortion(object):
         assert img.dtype == np.float32, \
             'PhotoMetricDistortion needs the input image of dtype np.float32,'\
             ' please set "to_float32=True" in "LoadImageFromFile" pipeline'
-        # random brightness
-        if random.randint(2):
-            delta = random.uniform(-self.brightness_delta,
-                                   self.brightness_delta)
-            img += delta
+        def _filter(img):
+            img[img < 0] = 0
+            img[img > 255] = 255
+            return img
 
-        # mode == 0 --> do random contrast first
-        # mode == 1 --> do random contrast last
-        mode = random.randint(2)
-        if mode == 1:
+        if random.uniform(0, 1) <= self.p:
+
+            # random brightness
             if random.randint(2):
-                alpha = random.uniform(self.contrast_lower,
-                                       self.contrast_upper)
-                img *= alpha
+                delta = random.uniform(-self.brightness_delta,
+                                    self.brightness_delta)
+                img += delta
+                img = _filter(img)
 
-        # convert color from BGR to HSV
-        img = mmcv.bgr2hsv(img)
+            # mode == 0 --> do random contrast first
+            # mode == 1 --> do random contrast last
+            mode = random.randint(2)
+            if mode == 1:
+                if random.randint(2):
+                    alpha = random.uniform(self.contrast_lower,
+                                        self.contrast_upper)
+                    img *= alpha
+                    img = _filter(img)
 
-        # random saturation
-        if random.randint(2):
-            img[..., 1] *= random.uniform(self.saturation_lower,
-                                          self.saturation_upper)
+            # convert color from BGR to HSV
+            img = mmcv.bgr2hsv(img)
 
-        # random hue
-        if random.randint(2):
-            img[..., 0] += random.uniform(-self.hue_delta, self.hue_delta)
-            img[..., 0][img[..., 0] > 360] -= 360
-            img[..., 0][img[..., 0] < 0] += 360
-
-        # convert color from HSV to BGR
-        img = mmcv.hsv2bgr(img)
-
-        # random contrast
-        if mode == 0:
+            # random saturation
             if random.randint(2):
-                alpha = random.uniform(self.contrast_lower,
-                                       self.contrast_upper)
-                img *= alpha
+                img[..., 1] *= random.uniform(self.saturation_lower,
+                                            self.saturation_upper)
 
-        # randomly swap channels
-        if random.randint(2):
-            img = img[..., random.permutation(3)]
+            # random hue
+            if random.randint(2):
+                img[..., 0] += random.uniform(-self.hue_delta, self.hue_delta)
+                img[..., 0][img[..., 0] > 360] -= 360
+                img[..., 0][img[..., 0] < 0] += 360
 
-        results['img'] = img
+            # convert color from HSV to BGR
+            img = mmcv.hsv2bgr(img)
+            img = _filter(img)
+
+            # random contrast
+            if mode == 0:
+                if random.randint(2):
+                    alpha = random.uniform(self.contrast_lower,
+                                        self.contrast_upper)
+                    img *= alpha
+                    img = _filter(img)
+
+            # randomly swap channels
+            if random.randint(2):
+                img = img[..., random.permutation(3)]
+
+            results['img'] = img
         return results
 
     def __repr__(self):
@@ -1138,7 +1477,7 @@ class MinIoURandomCrop(object):
     def __repr__(self):
         repr_str = self.__class__.__name__
         repr_str += f'(min_ious={self.min_ious}, '
-        repr_str += f'min_crop_size={self.min_crop_size}, '
+        repr_str += f'min_crop_size={self.min_crop_size}), '
         repr_str += f'bbox_clip_border={self.bbox_clip_border})'
         return repr_str
 
@@ -1725,7 +2064,7 @@ class RandomCenterCropPad(object):
         repr_str += f'std={self.input_std}, '
         repr_str += f'to_rgb={self.to_rgb}, '
         repr_str += f'test_mode={self.test_mode}, '
-        repr_str += f'test_pad_mode={self.test_pad_mode}, '
+        repr_str += f'test_pad_mode={self.test_pad_mode}), '
         repr_str += f'bbox_clip_border={self.bbox_clip_border})'
         return repr_str
 
