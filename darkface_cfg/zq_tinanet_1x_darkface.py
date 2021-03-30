@@ -13,19 +13,31 @@ model = dict(
         #norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=False,  # 归一化的评价 Note: Effect on Batch Norm and its variants only.
         style='pytorch'),  # pytorch风格的网络，stride=2的3*3卷积层
-    neck=dict(
-        type='FPN',
-        in_channels=[256, 512, 1024, 2048],  # 输入的各个stage通道数
-        out_channels=256,  # 输出的每个尺度特征层通道数
-        start_level=0,  # 从输入多尺度特征图第0个开始算，一共四个
-        add_extra_convs='on_input',  # 额外的2个输出来源是由backbone输出的两个特征图
-        num_outs=6),  # FPN输出特征图个数6，且通道数都是256，加了一层octave是为了检测小样本
+    neck=[
+        dict(
+            type='FPN',
+            in_channels=[256, 512, 1024, 2048],  # 输入的各个stage通道数
+            out_channels=256,  # 输出的每个尺度特征层通道数
+            start_level=0,  # 从输入多尺度特征图第0个开始算，一共四个
+            add_extra_convs='on_input',  # 额外的2个输出来源是由backbone输出的两个特征图
+            num_outs=6,  # FPN输出特征图个数6，且通道数都是256，加了一层octave是为了检测小样本
+            upsample_cfg=dict(mode='bilinear')  
+        ),     
+        dict(  
+            type='Inception',
+            in_channel=256,
+            num_levels=6,
+            norm_cfg=norm_cfg,
+            share=True
+        )
+    ],
     bbox_head=dict(
         type='RetinaHead',  # 两个分支，每支4个卷积层
         num_classes=1,  # coco数据集的类别数
         in_channels=256,  # FPN输出的通道数
         stacked_convs=4,  # 每个分支堆叠四个卷积层
         feat_channels=256,  # 中间特征图通道数
+        norm_cfg=norm_cfg,  # 徽哥加的
         anchor_generator=dict(
             type='AnchorGenerator',  # 特征图anchor的base越大，所有的anchor的尺度都会变大
             octave_base_scale=2 ** (4 / 3),  # 每个尺度下的基准尺度
@@ -34,7 +46,8 @@ model = dict(
             strides=[4, 8, 16, 32, 64, 128]),  # 每层尺度下的anchor步长大小
         bbox_coder=dict(
             type='DeltaXYWHBBoxCoder',
-            target_means=[0.0, 0.0, 0.0, 0.0],
+            #target_means=[0.0, 0.0, 0.0, 0.0],
+            target_means=[.0, .0, .0, .0],
             #target_stds=[1.0, 1.0, 1.0, 1.0]),  # 这里为什么要改标准化方差
             target_stds=[0.1, 0.1, 0.2, 0.2]), 
         loss_cls=dict(  # 分类损失
@@ -43,6 +56,7 @@ model = dict(
             gamma=2.0,
             alpha=0.25,
             loss_weight=1.0),
+        reg_decoded_bbox=True,  # 徽哥加的
         #loss_bbox=dict(type='L1Loss', loss_weight=1.0)),  # 改成了DIoULoss
         loss_bbox=dict(type='DIoULoss', loss_weight=2.0)),  # 回归损失  
     train_cfg=dict(
@@ -56,11 +70,11 @@ model = dict(
         pos_weight=-1,
         debug=False),
     test_cfg=dict(
-        nms_pre=-1,  # nms前每个输出层最多保留多少个框，-1不限制
+        nms_pre=1000,  # nms前每个输出层最多保留多少个框，-1不限制
         min_bbox_size=0,  # 过滤掉最小bbox的尺寸
         score_thr=0.05,  # 分数的阈值
-        nms=dict(type='nms', iou_threshold=0.5),  # nms方法和nms阈值 
-        #nms=dict(type='lb_nms', iou_threshold=0.45),  # tinaface使用lb_nms方法
+        #nms=dict(type='nms', iou_threshold=0.5),  # nms方法和nms阈值 
+        nms=dict(type='lb_nms', iou_threshold=0.45),  # tinaface使用lb_nms方法
         max_per_img=100))  # 最终输出的每张照片最多bbox个数
 
 # dataset settings
@@ -71,23 +85,19 @@ img_norm_cfg = dict(
 train_pipeline = [
     dict(type='LoadImageFromFile',to_float32=True),
     dict(type='LoadAnnotations', with_bbox=True),
-    dict(type='Resize', img_scale=(1080, 720), keep_ratio=True),
+    dict(type='FilterAnnotations', min_gt_bbox_wh=[1, 1]), 
+    dict(type='RandomSquareCrop', crop_choice=[0.3, 0.45, 0.6, 0.8, 1.0]), 
+    dict(
+        type='PhotoMetricDistortion',
+         brightness_delta=32,
+         contrast_range=(0.5, 1.5),
+         saturation_range=(0.5, 1.5),
+         hue_delta=18),
     dict(type='RandomFlip', flip_ratio=0.5),
+    dict(type='Resize', img_scale=(1080, 720), keep_ratio=True),
     dict(type='Normalize',**img_norm_cfg),  # **的作用是将字典拆成两个独立的形参传入函数
-    dict(type='Pad', size_divisor=32),
     dict(type='DefaultFormatBundle'),
-    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels']),
-
-    #dict(type='FilterAnnotations', min_gt_bbox_wh=[1, 1]),                     # 下面这几句都是zehui加的
-    #dict(
-    #    type='RandomSquareCrop',
-    #    crop_choice=[0.3, 0.45, 0.6, 0.8, 1.0]),  # KeyError: 'RandomSquareCrop is not in the pipeline registry'
-    #dict(
-    #    type='PhotoMetricDistortion',
-     #    brightness_delta=32,
-     #    contrast_range=(0.5, 1.5),
-     #    saturation_range=(0.5, 1.5),
-     #    hue_delta=18),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels']),               
 ]
 test_pipeline = [
     dict(type='LoadImageFromFile'),
@@ -104,8 +114,8 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=1,
+    samples_per_gpu=2,
+    workers_per_gpu=2,
     train=dict(
         type='CocoDataset',
         ann_file=
@@ -130,15 +140,24 @@ data = dict(
 
 # optimizer
 evaluation = dict(interval=1, metric='bbox')
-optimizer = dict(type='SGD', lr=0.00001, momentum=0.9, weight_decay=0.0001)
+optimizer = dict(type='SGD', lr=0.0005, momentum=0.9, weight_decay=5e-4)
 optimizer_config = dict(grad_clip=None)
+#lr_config = dict(
+#    policy='step',
+#    warmup='linear',
+#    warmup_iters=500,
+#    warmup_ratio=0.001,
+#    step=[8, 11])
 lr_config = dict(
-    policy='step',
+    policy='CosineRestart',
     warmup='linear',
     warmup_iters=500,
-    warmup_ratio=0.001,
-    step=[8, 11])
-total_epochs = 12
+    warmup_ratio=0.1,
+    min_lr_ratio=0.01,
+    periods=[30] * 21,
+    restart_weights=[1] * 21,
+    )
+total_epochs = 24
 checkpoint_config = dict(interval=1)
 log_config = dict(interval=1, hooks=[dict(type='TextLoggerHook')])
 custom_hooks = [dict(type='NumClassCheckHook')]
@@ -147,5 +166,5 @@ log_level = 'INFO'
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
-work_dir = '/gdata2/zhuqi/work_dirs/tinaface'
+work_dir = '/gdata2/zhuqi/work_dirs/tinaface/2x'
 gpu_ids = range(0, 1)
